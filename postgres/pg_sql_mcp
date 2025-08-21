@@ -1,0 +1,198 @@
+import os
+import time
+import smtplib
+import psycopg2
+import re
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import requests
+
+# --- Configuration ---
+
+# PostgreSQL Database Configuration
+DB_HOST = "localhost"
+DB_PORT = "5432"
+DB_NAME = "your_db_name"
+DB_USER = "your_db_user"
+DB_PASSWORD = "your_db_password"
+
+# PostgreSQL Log File Path
+# This path depends on your OS and PostgreSQL configuration.
+# Example for Linux: '/var/log/postgresql/postgresql-13-main.log'
+# Example for Windows: 'C:/Program Files/PostgreSQL/13/data/pg_log/postgresql.log'
+POSTGRES_LOG_FILE = "/path/to/your/postgresql.log"
+
+# Gemini API Configuration
+# IMPORTANT: It is highly recommended to use environment variables for your API key.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
+
+# Email Configuration
+SMTP_SERVER = "smtp.gmail.com"  # Example for Gmail
+SMTP_PORT = 587
+SMTP_USER = "your_email@gmail.com"
+SMTP_PASSWORD = "your_app_password"  # Use an app-specific password for Gmail
+EMAIL_FROM = "your_email@gmail.com"
+EMAIL_TO = "recipient_email@example.com"
+
+# --- Main Application Logic ---
+
+def get_tuned_query(original_query):
+    """
+    Sends the original SQL query to the Gemini API for tuning.
+    """
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
+        print("ERROR: Gemini API key not configured.")
+        return "Error: Gemini API key not set."
+
+    prompt = f"""
+    As an expert PostgreSQL DBA, please analyze the following SQL query and provide an optimized version.
+    Explain the reasons for your proposed changes, focusing on performance improvements like indexing, join optimization, and query rewriting.
+    Keep the core logic of the query the same.
+
+    Original Query:
+    ```sql
+    {original_query}
+    ```
+
+    Optimized Query and Explanation:
+    """
+
+    payload = {
+        "contents": [{
+            "parts": [{
+                "text": prompt
+            }]
+        }]
+    }
+
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        response = requests.post(GEMINI_API_URL, json=payload, headers=headers)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        result = response.json()
+        
+        if 'candidates' in result and result['candidates']:
+            return result['candidates'][0]['content']['parts'][0]['text']
+        else:
+            return "Could not get a tuned query from Gemini."
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Gemini API: {e}")
+        return f"Error contacting Gemini API: {e}"
+
+def send_email(original_query, tuned_query_details):
+    """
+    Sends an email with the original and tuned queries.
+    """
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_FROM
+    msg['To'] = EMAIL_TO
+    msg['Subject'] = "PostgreSQL Query Tuning Suggestion"
+
+    body = f"""
+    <html>
+    <head></head>
+    <body>
+        <h2>PostgreSQL Query Optimization Suggestion</h2>
+        <p>An SQL query was intercepted and analyzed for potential optimization.</p>
+        
+        <h3>Original Query:</h3>
+        <pre><code style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; display: block;">{original_query}</code></pre>
+        
+        <h3>Gemini's Suggested Optimization:</h3>
+        <div style="background-color: #e6f7ff; padding: 15px; border-radius: 5px; border-left: 5px solid #1890ff;">
+            {tuned_query_details.replace('```sql', '<pre><code style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; display: block;">').replace('```', '</code></pre>')}
+        </div>
+        
+        <p style="font-size: 0.8em; color: #888;">This is an automated message from the PostgreSQL MCP Server.</p>
+    </body>
+    </html>
+    """
+    msg.attach(MIMEText(body, 'html'))
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+            print("Successfully sent email.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+def follow_log_file(filepath):
+    """
+    A generator function that yields new lines from a file.
+    """
+    if not os.path.exists(filepath):
+        print(f"Error: Log file not found at {filepath}")
+        return
+        
+    with open(filepath, 'r') as file:
+        # Go to the end of the file
+        file.seek(0, 2)
+        while True:
+            line = file.readline()
+            if not line:
+                time.sleep(0.1)  # Wait for new lines
+                continue
+            yield line
+
+def parse_log_line(line):
+    """
+    Parses a PostgreSQL log line to extract the SQL query.
+    This regex might need to be adjusted based on your specific log format.
+    """
+    # Example log line: 2023-10-27 10:30:00.123 UTC [12345] LOG:  statement: SELECT * FROM users WHERE id = 1;
+    match = re.search(r'statement:\s+(.*)', line, re.IGNORECASE)
+    if match:
+        query = match.group(1).strip()
+        # Ignore internal or trivial queries
+        if query.lower().startswith(('begin', 'commit', 'set', 'show')):
+            return None
+        return query
+    return None
+
+def main():
+    """
+    Main function to run the MCP server.
+    """
+    print("Starting PostgreSQL MCP Server...")
+    print(f"Monitoring log file: {POSTGRES_LOG_FILE}")
+    
+    # Optional: Test database connection on startup
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+        conn.close()
+        print("Successfully connected to PostgreSQL database.")
+    except psycopg2.OperationalError as e:
+        print(f"Could not connect to PostgreSQL database: {e}")
+        print("Please check your database configuration.")
+        return
+
+    log_lines = follow_log_file(POSTGRES_LOG_FILE)
+    for line in log_lines:
+        query = parse_log_line(line)
+        if query:
+            print(f"\n--- Intercepted Query ---\n{query}")
+            
+            # Get the tuned query from Gemini
+            print("Sending to Gemini for tuning...")
+            tuned_details = get_tuned_query(query)
+            
+            print(f"--- Gemini's Response ---\n{tuned_details}")
+            
+            # Email the results
+            send_email(query, tuned_details)
+
+if __name__ == "__main__":
+    main()
