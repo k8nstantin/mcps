@@ -1,0 +1,157 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+)
+
+// YAML template for Linux systems using host network mode.
+const linuxYAMLTemplate = `version: "3"
+services:
+  fe:
+    image: apache/doris:fe-%s
+    hostname: fe
+    environment:
+     - FE_SERVERS=fe1:127.0.0.1:9010
+     - FE_ID=1
+    network_mode: host
+  be:
+    image: apache/doris:be-%s
+    hostname: be
+    environment:
+     - FE_SERVERS=fe1:127.0.0.1:9010
+     - BE_ADDR=127.0.0.1:9050
+    depends_on:
+      - fe
+    network_mode: host
+`
+
+// YAML template for Mac (Darwin) systems using a custom bridge network.
+const darwinYAMLTemplate = `version: "3"
+networks:
+  custom_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.80.0/24
+
+services:
+  fe:
+    image: apache/doris:fe-%s
+    hostname: fe
+    ports:
+      - 8030:8030
+      - 9030:9030
+      - 9010:9010
+    environment:
+      - FE_SERVERS=fe1:172.20.80.2:9010
+      - FE_ID=1
+    networks:
+      custom_network:
+        ipv4_address: 172.20.80.2
+
+  be:
+    image: apache/doris:be-%s
+    hostname: be
+    ports:
+      - 8040:8040
+      - 9050:9050
+    environment:
+      - FE_SERVERS=fe1:172.20.80.2:9010
+      - BE_ADDR=172.20.80.3:9050
+    depends_on:
+      - fe
+    networks:
+      custom_network:
+        ipv4_address: 172.20.80.3
+`
+
+func main() {
+	// 1. Parse command-line parameters
+	dorisVersion := flag.String("v", "2.1.9", "Doris quick start version")
+	flag.Parse()
+
+	// 2. Check system type
+	osType := runtime.GOOS
+	if osType != "linux" && osType != "darwin" {
+		log.Fatalf("Error: Unsupported operating system [%s], only Linux and Mac are supported", osType)
+	}
+
+	// 3. Check for Docker environment
+	if _, err := exec.LookPath("docker"); err != nil {
+		log.Fatal("Error: Docker environment not detected, please install Docker first")
+	}
+
+	// 4. Find a valid docker-compose command
+	composeCmd, err := findComposeCommand()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 5. Generate docker-compose configuration for the corresponding system
+	var yamlContent string
+	if osType == "linux" {
+		yamlContent = fmt.Sprintf(linuxYAMLTemplate, *dorisVersion, *dorisVersion)
+	} else { // darwin
+		yamlContent = fmt.Sprintf(darwinYAMLTemplate, *dorisVersion, *dorisVersion)
+	}
+
+	err = os.WriteFile("docker-compose-doris.yaml", []byte(yamlContent), 0644)
+	if err != nil {
+		log.Fatalf("Error writing docker-compose file: %v", err)
+	}
+
+	// 6. Start services
+	fmt.Println("Starting Doris cluster...")
+	cmdArgs := strings.Fields(composeCmd)
+	cmdArgs = append(cmdArgs, "-f", "docker-compose-doris.yaml", "up", "-d")
+
+	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Error starting services with docker-compose: %v", err)
+	}
+
+	// 7. Display success message and next steps
+	fmt.Printf("\nDoris cluster started successfully, version: %s\n", *dorisVersion)
+	fmt.Println("You can manage the cluster using the following commands:")
+	fmt.Printf("  Stop cluster: %s -f docker-compose-doris.yaml down\n", composeCmd)
+	fmt.Printf("  View logs: %s -f docker-compose-doris.yaml logs -f\n", composeCmd)
+	fmt.Println("  Connect to cluster: mysql -uroot -P9030 -h127.0.0.1")
+
+	// 8. Display connection information based on system type
+	if osType == "linux" {
+		fmt.Println("\nAccess FE/BE http ports (8030, 8040) using the following addresses (Linux system):")
+		fmt.Println("  http://127.0.0.1:8030")
+		fmt.Println("  http://127.0.0.1:8040")
+	} else { // darwin
+		fmt.Println("\nAccess FE/BE http ports (8030, 8040) using the following addresses (Mac system):")
+		fmt.Println("  http://docker.for.mac.localhost:8030")
+		fmt.Println("  http://docker.for.mac.localhost:8040")
+		fmt.Println("Note: If access fails, try using 127.0.0.1 address:")
+		fmt.Println("  http://127.0.0.1:8030")
+		fmt.Println("  http://127.0.0.1:8040")
+	}
+}
+
+// findComposeCommand checks for `docker-compose` and `docker compose` and returns the valid command.
+func findComposeCommand() (string, error) {
+	// First, check for standalone 'docker-compose'
+	if _, err := exec.LookPath("docker-compose"); err == nil {
+		return "docker-compose", nil
+	}
+
+	// Next, check for the 'docker compose' plugin
+	cmd := exec.Command("docker", "compose", "version")
+	if err := cmd.Run(); err == nil {
+		return "docker compose", nil
+	}
+
+	return "", fmt.Errorf("Error: docker-compose plugin or docker-compose command is required")
+}
